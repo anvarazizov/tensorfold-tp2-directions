@@ -1,0 +1,24 @@
+{
+  "c32-32k": {
+    "passed": true,
+    "target_prompt_tokens": 32000,
+    "new_token_budget": 512,
+    "mixed_decode_peak": 32,
+    "token_matches_solo": true,
+    "all_packets_match": true,
+    "minimum_tested_prompt_tokens": 31988,
+    "failures": [],
+    "concurrent_requests": 32
+  },
+  "c32-500k-64k": {
+    "passed": true,
+    "target_prompt_tokens": 64000,
+    "new_token_budget": 2048,
+    "mixed_decode_peak": 32,
+    "token_matches_solo": true,
+    "all_packets_match": true,
+    "minimum_tested_prompt_tokens": 63994,
+    "failures": [],
+    "concurrent_requests": 32
+  }
+}

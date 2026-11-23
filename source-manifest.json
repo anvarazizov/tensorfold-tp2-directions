@@ -1,0 +1,87 @@
+{
+  "engine_commit": "e100ee8b1d806a9f516d7a01cbcbf06ae98d77e1",
+  "files": {
+    "zig/kernels/cuda/runtime_directions.cu": {
+      "before": null,
+      "after": "ba4973a22dbde11dcbf2756ca6b474235dbcb8af39de13503e5ba10fff336d36"
+    },
+    "zig/src/core/engine_api.zig": {
+      "before": "0665a91e85ef85547475cc8d7d9b93f23f1cb13d4d30668875c6cdfcca3de7fd",
+      "after": "dd896fd37d5e16d7c6eb80b130a9a205beebb6d1208af4febdb34cde58ba5000"
+    },
+    "zig/src/core/lane_host.zig": {
+      "before": "774da9d24c18e72b9e96e8a7a9aa890f12b8cb164e06d6cc1d56f54aa29aad4f",
+      "after": "65f1df143f766f1c12685b87c04bb76f76734fc44b3f0a31dee67278c8fd6552"
+    },
+    "zig/src/core/lanes/stream.zig": {
+      "before": "4c05bed0fb6b49e95118a4d46b53c840c1e00a7d3cbd9240659c006391f6faef",
+      "after": "80045304af46991526fd1b774c7097819577321015b33a369c00dacb40d31c16"
+    },
+    "zig/src/families/dsv41/dsv41.zig": {
+      "before": "6c00b58296b71ac864272e74f227d36cef0f26f0bb94df9ee51589de5e77cf72",
+      "after": "66c3a53eec459bb853831e1df0a739b73404b09e4024b663e389f1eb1debd8eb"
+    },
+    "zig/src/families/dsv41/lanes.zig": {
+      "before": "77c55f514b124481cb848ebe7e289ba3ed5d71382bfb286b395f3049ce0ec8bb",
+      "after": "15469f4c5674d45cd783bd6e4f4ac51b26af948b8ab306c419dda043a2cb8df6"
+    },
+    "zig/src/families/dsv41/layer_main.zig": {
+      "before": "1ae743d5e7bc04abacff0a219813dd81391b78274ea8e8982f019b15d442e774",
+      "after": "26a84bc42c5cbd87e6cde73b4b19ddd270c16d4dbcf270fe9907b012940ea9e2"
+    },
+    "zig/src/families/dsv41/model.zig": {
+      "before": "3611579662c5e058dbe29201f58eab372c011eecf6575b5df36ad7bfa017e98d",
+      "after": "d0505b98dd7ff5f28f79dae70a9322722215170ac83f5598f787d4690035c64b"
+    },
+    "zig/src/families/dsv41/prompt.zig": {
+      "before": "0a57d971797eaf38c960f0714fd144aabc8c7c3341c79ce46913f97162737386",
+      "after": "26ca966b9e8b7231cf8dda77686e9895b05242f27649542f5966edf64e888b4a"
+    },
+    "zig/src/families/dsv41/rank_cache_main.zig": {
+      "before": "7b94520326c73109d2f5163093be7712e7ad8a4c6cd781254be4bad1667a48e3",
+      "after": "704dc3ac8b057a3b3fed179eb3c94c934b78d02aebd2c290b02b6936f4280843"
+    },
+    "zig/src/families/dsv41/round.zig": {
+      "before": "1f146d4573b2162f5c14cf9e9582b75e3f6141acb7c718a2fd1dd512b01746bf",
+      "after": "426fd513382a77e5a93adb388d57fb1e3e1cba8612d9d9fa83200ed43e6c379e"
+    },
+    "zig/src/families/dsv41/runtime_directions.zig": {
+      "before": null,
+      "after": "d9d064543316bb5973203308a5cc343f7db6a1b36fcf28c70e8aaea1cf57bfd0"
+    },
+    "zig/src/native/cuda.zig": {
+      "before": "06c715c9a6fad5086a091bdc39f7ddbbf0059c3a67b292df9e736605654e554e",
+      "after": "3eba0d4d35c1160027b8675614329b1041934836e9cbc98bee24de6edd96635b"
+    },
+    "zig/src/server/anthropic.zig": {
+      "before": "b61889a282d7a57309759603d27767b35569d4eaae22c8b4e3255174c530d144",
+      "after": "54516e3b3eacdd93f1fd2320657a5acaf5ee83e7623a7b4c35c588e2cf797aed"
+    },
+    "zig/src/server/chat.zig": {
+      "before": "571fd42c1c93a6baacaad63c3d5308a129e7ddfb13eb18680feda486a4b7c532",
+      "after": "f3abf69b9841b5abed6057078b5df8b6faa7b04423d1204bda0892450148947f"
+    },
+    "zig/src/server/openai.zig": {
+      "before": "f20a502cb12a9eaff74f550986dfc446e2e3c23896520840976aaa10d76f8458",
+      "after": "b3f12f419b6cb178ff9c7b9891fd3356e0f6c93f392dd65d1f903fbda831001c"
+    },
+    "zig/src/server/responses_translate.zig": {
+      "before": "f51b1c93e8faac7665819b8798f75ba60a1db63255ad7fe71f87b52fcdb61556",
+      "after": "d063d31ace16068e15da55a350750434356145abadfd2d248c6b1df85defd766"
+    },
+    "zig/src/server/root.zig": {
+      "before": "ba9dadeb5dd369c2694dc6e69c0a9c04826fddcd141b57e1dab201c79867a48f",
+      "after": "1db35ad451e6b56be427781660f6d5672300fca4a83200bc7f4e356f7e0b4374"
+    },
+    "zig/src/server/runtime_directions_api.zig": {
+      "before": null,
+      "after": "d1e5a6905424daa8065ba901262f0abfabd7e1b08fb1e0877f24108a30eeae3b"
+    },
+    "zig/src/server/warm.zig": {
+      "before": "33419dbf05032e6643ca50ed59f3a0c44bc34112dc524e04d4f0575e3e77409e",
+      "after": "47ec1027074e2eb11d007e647fa74b663f73c9adbe3eb1686d92073cf1a9cb2d"
+    }
+  },
+  "includes": "runtime r2 + exact-size file-read fix + GID3 + streamed cache-builder variant",
+  "source_url": "https://github.com/bertholomus/TensorFold"
+}

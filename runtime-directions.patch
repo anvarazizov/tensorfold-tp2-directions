@@ -1,0 +1,731 @@
+--- /dev/null
++++ b/zig/kernels/cuda/runtime_directions.cu
+@@ -0,0 +1,23 @@
++// One block per full-width rank-local wo_b output, before the existing TP gather.
++// TP2 splits inputs; each partial spans all 5120 output coordinates.
++// Launch only for nonzero alpha. No residual/hyperconnection tensor is touched.
++#include <cuda_runtime.h>
++extern "C" __global__ void tf_runtime_direction_f32(
++    float* y, const float* r, float alpha, unsigned int rows) {
++    const unsigned int row = blockIdx.x;
++    if (row >= rows || alpha == 0.0f) return;
++    __shared__ float partial[256];
++    const unsigned int t = threadIdx.x;
++    float dot = 0.0f;
++    for (unsigned int j = t; j < 5120; j += 256)
++        dot = __fadd_rn(dot, __fmul_rn(y[row * 5120 + j], r[j]));
++    partial[t] = dot;
++    __syncthreads();
++    for (unsigned int stride = 128; stride; stride >>= 1) {
++        if (t < stride) partial[t] = __fadd_rn(partial[t], partial[t + stride]);
++        __syncthreads();
++    }
++    const float scale = __fmul_rn(alpha, partial[0]);
++    for (unsigned int j = t; j < 5120; j += 256)
++        y[row * 5120 + j] = __fsub_rn(y[row * 5120 + j], __fmul_rn(scale, r[j]));
++}
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -66,6 +66,7 @@
+ 
+ /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
+ pub const Request = struct {
++    runtime_directions: [44]u8 = @splat(0),
+     prompt: []const u32,
+     /// A lane-vision family's images in order, each span inside the prompt (its positions hold the image token).
+     lane_images: []const LaneImage = &.{},
+@@ -246,6 +247,7 @@
+ 
+ /// What the engine serves, fixed once it has loaded.
+ pub const Info = struct {
++    runtime_directions_supported: bool = false,
+     name: []const u8 = "lanes",
+     lanes: u32 = 1,
+     /// Prompt plus reply tokens one request may use (0: no limit).
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -355,6 +355,7 @@
+         const recall = recalls.reader(h, job);
+         job.stream = lanes.Stream.init(h.gpa, .{
+             .id = "request",
++            .runtime_directions = r.runtime_directions,
+             .prompt = r.prompt,
+             .max_new = r.max_tokens,
+             .eos = r.eos,
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -132,6 +132,7 @@
+ pub const Image = struct { pixels: []const f32, gh: u32, gw: u32, at: u32, tokens: u32 };
+ 
+ pub const Spec = struct {
++    runtime_directions: [44]u8 = @splat(0),
+     id: []const u8,
+     prompt: []const u32,
+     max_new: u32,
+@@ -166,6 +167,7 @@
+ };
+ 
+ pub const Stream = struct {
++    runtime_directions: [44]u8 = @splat(0),
+     id: []const u8,
+     prompt_len: usize,
+     max_new: u32,
+@@ -242,6 +244,7 @@
+     pub fn init(gpa: Allocator, spec: Spec) !Stream {
+         var s: Stream = .{
+             .id = spec.id,
++            .runtime_directions = spec.runtime_directions,
+             .prompt_len = spec.prompt.len,
+             .max_new = spec.max_new,
+             .eos = spec.eos,
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -96,6 +96,7 @@
+     refAll(markov_tokens);
+     refAll(draft);
+     refAll(sampling);
++    refAll(@import("runtime_directions.zig"));
+     refAll(model);
+     refAll(lanes);
+ }
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -41,7 +41,7 @@
+ pub var logits_sha = false;
+ 
+ /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_switch = 10 };
++pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_switch = 10, runtime_directions = 11 };
+ 
+ /// A frame being written.
+ pub const Wire = struct {
+@@ -333,6 +333,7 @@
+ /// [base, base + at), held back from placement while it lives. Stale: a placement needed that room (its restore fails
+ /// and the prompt runs from 0).
+ pub const Snap = struct {
++    runtime_directions: [44]u8 = @splat(0),
+     id: u64,
+     at: usize,
+     base: usize,
+@@ -442,6 +443,7 @@
+     masked: []f32 = &.{},
+ 
+     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
++        if (std.c.getenv("TF_RUNTIME_LOGITS_SHA")) |v| logits_sha = std.mem.eql(u8, std.mem.span(v), "1");
+         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
+         // the round costs by rows: ROUND_MS[min(rows, len) - 1] (the served table, or TF_DS_ROUND_MS)
+         const t = m.round_ms;
+@@ -706,6 +708,19 @@
+ 
+     /// A prompt pass's start: its slot and extent, its images, rank 1's fill and the kept state it resumes from.
+     fn fillOpen(self: *Lanes, s: *lanes.Stream) !void {
++        // Before ANY cache restore or GPU prefill. C1 prevents another stream changing this selection.
++        if (self.m.runtime_directions) |rt| {
++            if (self.streams.count() != 0) return error.DirectionsRequireSerialEagerTP2;
++            if (s.drafts) return error.DirectionsRequireSerialEagerTP2;
++            try rt.select(s.runtime_directions);
++            if (!try self.begin(.runtime_directions)) return error.NoDirectionPeer;
++            try self.wire.buf.appendSlice(self.gpa, &s.runtime_directions);
++            try self.wire.buf.appendSlice(self.gpa, &rt.identity);
++            try self.flush();
++            var ack: [85]u8 = undefined;
++            const got = try self.peer.?.recv(&ack);
++            if (!std.mem.eql(u8, got, self.wire.buf.items)) return error.DirectionPeerMismatch;
++        } else if (!std.mem.allEqual(u8, &s.runtime_directions, 0)) return error.DirectionsUnavailable;
+         const m = self.m;
+         const gpa = self.gpa;
+         const ids = s.prompt();
+@@ -730,7 +745,9 @@
+         if (s.reuse.saved) |p| {
+             const sn: *Snap = @ptrCast(@alignCast(p));
+             // (the cache matched the images before its rows by their digests: its image rows are this prompt's)
+-            if (self.refusal(sn, len)) |why| {
++            if (!std.mem.eql(u8, &sn.runtime_directions, &s.runtime_directions)) {
++                s.reuse_failed = true; // exact packet guard, independent of cache_salt's hash
++            } else if (self.refusal(sn, len)) |why| {
+                 noteRefusal(sn, len, why, "it runs from 0");
+                 s.reuse_failed = true;
+             } else {
+@@ -881,6 +898,10 @@
+         const m = self.m;
+         const gpa = self.gpa;
+         if (windows.len > max_streams) return error.WindowTooWide;
++        if (m.runtime_directions) |rt| {
++            if (windows.len != 1 or !std.mem.eql(u8, &windows[0].stream.runtime_directions, &rt.active))
++                return error.DirectionStreamMismatch;
++        }
+         var ids: [max_streams][max_rows]i32 = undefined;
+         var wins: [max_streams]Win = undefined;
+         const words = maskWords(m.vocab);
+@@ -1132,7 +1153,7 @@
+         if (at == 0 or at % model.resume_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+         const sn = try self.gpa.create(Snap);
+         errdefer self.gpa.destroy(sn);
+-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
++        sn.* = .{ .runtime_directions = if (self.m.runtime_directions) |rt| rt.active else @splat(0), .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
+         errdefer sn.buf.free();
+         try self.snaps.append(self.gpa, sn);
+         self.next_snap += 1;
+@@ -1247,6 +1268,7 @@
+             8 => .fill_images,
+             9 => .done,
+             10 => .fill_switch,
++            11 => .runtime_directions,
+             else => return error.BadFrame,
+         };
+         if (try r.int(u64) != step) return error.OutOfStep;
+@@ -1257,6 +1279,15 @@
+             m.fill_seq = &.{};
+         }
+         switch (kind) {
++            .runtime_directions => {
++                const rt = m.runtime_directions orelse return error.DirectionsUnavailable;
++                if (r.b.len != 85) return error.BadFrame;
++                if (!std.mem.eql(u8, r.b[53..85], &rt.identity)) return error.DirectionPeerMismatch;
++                const packet: [44]u8 = r.b[9..53].*;
++                try rt.select(packet);
++                // Echo includes protocol kind and monotonic step, not only the parameters.
++                try peer.send(r.b);
++            },
+             .fill_begin => {
+                 slot = try r.int(u32);
+                 const base = try r.int(u64);
+--- a/zig/src/families/dsv41/layer_main.zig
++++ b/zig/src/families/dsv41/layer_main.zig
+@@ -424,7 +424,7 @@
+         var devices: std.ArrayList([]const u8) = .empty;
+         var dit = std.mem.splitScalar(u8, rdma_devices.?, ',');
+         while (dit.next()) |d| try devices.append(a, d);
+-        rdma_rings = try dsv41.ring2d.Rings.open(gpa, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = 5 }, &comm, stream);
++        rdma_rings = try dsv41.ring2d.Rings.open(gpa, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = 3 }, &comm, stream);
+         two.?.rings = &rdma_rings.?;
+     }
+     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -85,6 +85,7 @@
+ }
+ 
+ pub const Model = struct {
++    runtime_directions: ?*@import("runtime_directions.zig").Runtime,
+     gpa: std.mem.Allocator,
+     host: std.heap.ArenaAllocator, // allocations that live as long as the model
+     io: std.Io,
+@@ -171,10 +172,14 @@
+     /// and sets up every buffer. Needs `ctx` current on this thread.
+     pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, o: Options) !*Model {
+         if (o.world != 2 and o.world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split (prompt2d.zig)
++        if (@import("runtime_directions.zig").configured() and
++            (o.world != 2 or o.streams != 1 or o.drafts or o.graphs or o.side))
++            return error.DirectionsRequireSerialEagerTP2;
+         const m = try gpa.create(Model);
+         errdefer gpa.destroy(m);
+         m.* = undefined;
+         m.gpa = gpa;
++        m.runtime_directions = null;
+         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+         try prompt.splitEnv(); // TF_DS_IDX_SPLIT: every rank alike too
+         prompt.aliasEnv(); // TF_DS_PROMPT_ALIAS: this rank's memory only
+@@ -224,6 +229,9 @@
+         const d = ctx.d;
+         m.cfg = try Config.read(a, io, o.model_dir);
+         const c = &m.cfg;
++        if (@import("runtime_directions.zig").configured() and c.hidden != 5120) return error.BadDirectionWidth;
++        m.runtime_directions = try @import("runtime_directions.zig").Runtime.open(a, io, d);
++        errdefer if (m.runtime_directions) |r| r.close();
+         m.stream = try cuda.Stream.init(d, true);
+         errdefer m.stream.deinit();
+ 
+@@ -332,11 +340,11 @@
+                 var devices: std.ArrayList([]const u8) = .empty;
+                 var dit = std.mem.splitScalar(u8, devs, ',');
+                 while (dit.next()) |x| try devices.append(a, x);
+-                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = 5 }, &m.comm, m.stream);
++                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = 3 }, &m.comm, m.stream);
+                 m.two.?.rings = &m.rdma_rings.?;
+             }
+         }
+-        m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
++        m.eng = .{ .runtime_directions = m.runtime_directions, .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+         m.eng.round_rows = o.round_rows;
+         if (m.par) |*x| m.eng.par = x;
+         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, m.ctx_cap); // a stream's keys at most
+@@ -407,6 +415,7 @@
+     pub fn close(m: *Model) void {
+         m.joinAhead();
+         m.stream.synchronize() catch {};
++        if (m.runtime_directions) |r| r.close();
+         if (m.img_buf) |*b| b.free();
+         m.spans.deinit(m.gpa);
+         if (m.graphs) |*g| g.deinit();
+@@ -464,7 +473,7 @@
+     /// connected, and started once both are (an all-gather as the barrier).
+     pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
+         if (comm.world != 2) return error.NotTwoRanks;
+-        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = 5 });
++        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = 3 });
+         errdefer r.destroy(gpa);
+         const per = @sizeOf(rdma.Info);
+         const mine = [2]rdma.Info{ r.info(0), r.info(1) };
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -152,6 +152,7 @@
+ 
+ /// What a chunk's steps run on: one rank's weights, kernels, stream and gather.
+ pub const Engine = struct {
++    runtime_directions: ?*const @import("runtime_directions.zig").Runtime = null,
+     d: *const cuda.Driver,
+     s: cuda.Stream,
+     t: tri.Tri,
+@@ -960,6 +961,7 @@
+     }
+     if (e.two) |t| return t.woB(e, ch, lay); // 2D: the column partner's groups first, then this pair's columns
+     try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, c.hidden);
++    if (e.runtime_directions) |r| try r.apply(e.s, li, ch.pa, ch.n);
+ }
+ 
+ /// kv_source_update of a kv-source layer on the chunk (no earlier pending row: a chunk starting on a group boundary):
+--- a/zig/src/families/dsv41/rank_cache_main.zig
++++ b/zig/src/families/dsv41/rank_cache_main.zig
+@@ -88,17 +88,22 @@
+         return 0;
+     }
+ 
+-    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, args[2], .{ .open_options = .{ .iterate = true } });
++    const streaming = std.mem.eql(u8, args[2], "-");
++    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, if (streaming) "." else args[2], .{ .open_options = .{ .iterate = true } });
+     defer dir.close(io);
++    if (!streaming) {
+     if (dsv41.rank_cache.find(a, io, dir, rank, world)) |old| {
+         std.debug.print("{s} already holds {s}: remove it or name an empty OUT_DIR\n", .{ args[2], old });
+         return 1;
+     } else |err| if (err != error.NoRankCache) return err;
++    }
+     const partial = try std.fmt.allocPrint(a, ".rank{d}of{d}.partial", .{ rank, world });
+-    var file = try dir.createFile(io, partial, .{});
+-    var file_open = true;
++    var file = if (streaming) std.Io.File.stdout() else try dir.createFile(io, partial, .{});
++    var file_open = !streaming;
+     defer if (file_open) file.close(io);
+-    errdefer dir.deleteFile(io, partial) catch {};
++    errdefer {
++        if (!streaming) dir.deleteFile(io, partial) catch {};
++    }
+     var wbuf: [1 << 20]u8 = undefined;
+     var fw = file.writer(io, &wbuf);
+     const w = &fw.interface;
+@@ -134,6 +139,7 @@
+     @memcpy(tail[8..], dsv41.rank_cache.magic);
+     try w.writeAll(&tail);
+     try w.flush();
++    if (streaming) return 0; // same complete bytes/footer, sent directly to the destination without a staging copy
+     try file.sync(io);
+     file.close(io);
+     file_open = false;
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -751,6 +751,7 @@
+     try rd.mark(e, .a_x);
+     var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
+     try prompt.groupedRotated(e, ch, R, &cb_call);
++    if (e.runtime_directions) |r| try r.apply(e.s, li, rd.pa, R);
+     // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert's gate
+     if (l2_skip & 2 == 0) try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, l2_mb[1] << 20);
+ }
+--- /dev/null
++++ b/zig/src/families/dsv41/runtime_directions.zig
+@@ -0,0 +1,143 @@
++//! Experimental C1 TP2 directions. Loaded only by an explicitly isolated profile.
++const std = @import("std");
++const cuda = @import("cuda");
++
++pub const Packet = [44]u8; // alpha LE f32, mask LE u64, payload SHA256
++pub const zero: Packet = @splat(0);
++const width = 5120;
++const payload_bytes = 40 * width * 4;
++
++fn env(name: [:0]const u8) ?[]const u8 {
++    return std.mem.span(std.c.getenv(name) orelse return null);
++}
++
++pub fn configured() bool {
++    return env("TF_RUNTIME_DIRECTIONS_BUNDLE") != null;
++}
++
++pub const Runtime = struct {
++    vectors: cuda.DeviceBuffer,
++    module: cuda.Module,
++    kernel: cuda.Function,
++    sha: [32]u8,
++    identity: [32]u8,
++    mask: u64,
++    active: Packet = zero,
++
++    pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver) !?*Runtime {
++        const path = env("TF_RUNTIME_DIRECTIONS_BUNDLE") orelse return null;
++        if (!std.mem.eql(u8, env("TF_RUNTIME_DIRECTIONS_EXPERIMENTAL") orelse "", "1"))
++            return error.DirectionsNotQualified;
++        // Zig readFileAlloc rejects a length equal to the limit; validate exact size below.
++        const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(payload_bytes + 17));
++        defer a.free(raw);
++        if (raw.len != payload_bytes + 16 or !std.mem.eql(u8, raw[0..8], "TFDIR001")) return error.BadDirections;
++        const mask = std.mem.readInt(u64, raw[8..16], .little);
++        if (mask == 0 or mask >> 40 != 0) return error.BadDirections;
++        var hash: [32]u8 = undefined;
++        std.crypto.hash.sha2.Sha256.hash(raw, &hash, .{});
++        var expected: [32]u8 = undefined;
++        const hex = env("TF_RUNTIME_DIRECTIONS_SHA256") orelse return error.BadDirections;
++        if (hex.len != 64) return error.BadDirections;
++        _ = try std.fmt.hexToBytes(&expected, hex);
++        if (!std.mem.eql(u8, &hash, &expected)) return error.DirectionsHashMismatch;
++        const allowed = try std.fmt.parseInt(u64, env("TF_RUNTIME_DIRECTIONS_MASK") orelse return error.BadDirections, 10);
++        if (allowed != mask) return error.BadDirections;
++        for (0..40) |layer| {
++            var norm: f64 = 0;
++            for (0..width) |j| {
++                const offset = 16 + (layer * width + j) * 4;
++                const v: f32 = @bitCast(std.mem.readInt(u32, raw[offset..][0..4], .little));
++                if (!std.math.isFinite(v)) return error.BadDirections;
++                norm += @as(f64, v) * v;
++            }
++            const present = mask & (@as(u64, 1) << @intCast(layer)) != 0;
++            if (if (present) @abs(norm - 1) > 1e-5 else norm != 0) return error.BadDirections;
++        }
++        const kernel_path = env("TF_RUNTIME_DIRECTIONS_KERNEL") orelse return error.NoDirectionKernel;
++        const image = try std.Io.Dir.cwd().readFileAlloc(io, kernel_path, a, .limited(4 << 20));
++        defer a.free(image);
++        const kernel_hex = env("TF_RUNTIME_DIRECTIONS_KERNEL_SHA256") orelse return error.NoDirectionKernel;
++        if (kernel_hex.len != 64) return error.NoDirectionKernel;
++        var kernel_expected: [32]u8 = undefined;
++        _ = try std.fmt.hexToBytes(&kernel_expected, kernel_hex);
++        var kernel_actual: [32]u8 = undefined;
++        std.crypto.hash.sha2.Sha256.hash(image, &kernel_actual, .{});
++        if (!std.mem.eql(u8, &kernel_expected, &kernel_actual)) return error.DirectionKernelHashMismatch;
++        const weight_hex = env("TF_RUNTIME_DIRECTIONS_WEIGHTS_SHA256") orelse return error.MissingWeightIdentity;
++        if (weight_hex.len != 64) return error.MissingWeightIdentity;
++        var weight_sha: [32]u8 = undefined;
++        _ = try std.fmt.hexToBytes(&weight_sha, weight_hex);
++        var identity_input: [96]u8 = undefined;
++        @memcpy(identity_input[0..32], &hash);
++        @memcpy(identity_input[32..64], &kernel_actual);
++        @memcpy(identity_input[64..96], &weight_sha);
++        var identity: [32]u8 = undefined;
++        std.crypto.hash.sha2.Sha256.hash(&identity_input, &identity, .{});
++        var mod = try cuda.Module.load(d, image);
++        errdefer mod.unload();
++        const kernel = try mod.function("tf_runtime_direction_f32");
++        var vectors = try cuda.DeviceBuffer.fromHost(d, raw[16..]);
++        errdefer vectors.free();
++        const result = try a.create(Runtime);
++        result.* = .{ .vectors = vectors, .module = mod, .kernel = kernel, .sha = hash, .identity = identity, .mask = mask };
++        return result;
++    }
++
++    pub fn close(r: *Runtime) void {
++        r.vectors.free();
++        r.module.unload();
++    }
++
++    pub fn select(r: *Runtime, packet: Packet) !void {
++        if (std.mem.eql(u8, &packet, &zero)) {
++            r.active = zero;
++            return;
++        }
++        const alpha: f32 = @bitCast(std.mem.readInt(u32, packet[0..4], .little));
++        const mask = std.mem.readInt(u64, packet[4..12], .little);
++        if (!std.math.isFinite(alpha) or alpha < 0 or alpha > 1 or mask == 0 or mask & ~r.mask != 0)
++            return error.BadDirectionsConfig;
++        if (!std.mem.eql(u8, packet[12..44], &r.sha)) return error.DirectionsHashMismatch;
++        r.active = packet;
++    }
++
++    pub fn apply(r: *const Runtime, stream: cuda.Stream, layer: usize, y: u64, rows: usize) !void {
++        if (layer >= 40) return error.BadDirectionLayer;
++        const alpha: f32 = @bitCast(std.mem.readInt(u32, r.active[0..4], .little));
++        const mask = std.mem.readInt(u64, r.active[4..12], .little);
++        // EXACT baseline bypass: no kernel, synchronization, or arithmetic.
++        if (alpha == 0 or mask & (@as(u64, 1) << @intCast(layer)) == 0 or rows == 0) return;
++        var args: cuda.Args = .{};
++        args.add(y);
++        args.add(r.vectors.ptr + layer * width * 4);
++        args.add(alpha);
++        args.add(@as(u32, @intCast(rows)));
++        try cuda.launch.launch(r.kernel, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &args);
++    }
++};
++
++test "runtime directions peer packet validation and zero reset" {
++    var r: Runtime = undefined; // no CUDA driver/context is created by this CPU test
++    r.sha = @splat(0xaa);
++    r.mask = 12;
++    r.active = zero;
++    var packet: Packet = zero;
++    std.mem.writeInt(u32, packet[0..4], @bitCast(@as(f32, 0.5)), .little);
++    std.mem.writeInt(u64, packet[4..12], 4, .little);
++    @memcpy(packet[12..44], &r.sha);
++    try r.select(packet);
++    try std.testing.expectEqual(packet, r.active);
++    var bad = packet;
++    bad[12] ^= 1;
++    try std.testing.expectError(error.DirectionsHashMismatch, r.select(bad));
++    try std.testing.expectEqual(packet, r.active);
++    bad = packet;
++    std.mem.writeInt(u64, bad[4..12], 1, .little);
++    try std.testing.expectError(error.BadDirectionsConfig, r.select(bad));
++    bad = packet;
++    std.mem.writeInt(u32, bad[0..4], 0x7fc00000, .little);
++    try std.testing.expectError(error.BadDirectionsConfig, r.select(bad));
++    try r.select(zero);
++    try std.testing.expectEqual(zero, r.active);
++}
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -235,6 +235,11 @@
+     "and the CUDA memory budget leaves {d:.2} GiB{s}: serve --parallel {d}, or lower --context";
+ 
+ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
++    if (std.c.getenv("TF_RUNTIME_DIRECTIONS_BUNDLE") != null and
++        (!std.mem.eql(u8, F.model_type, "deepseek_v41") or o.lanes != 1)) {
++        problem.* = "runtime directions v1 requires DeepSeek V4.1 and --parallel 1";
++        return null;
++    }
+     if (refusals.family(F, o)) |why| {
+         problem.* = why;
+         return null;
+@@ -469,6 +474,7 @@
+         .lanes = streams,
+         .context_window = @intCast(window),
+         .startup = h.startup,
++        .runtime_directions_supported = std.mem.eql(u8, F.model_type, "deepseek_v41") and std.c.getenv("TF_RUNTIME_DIRECTIONS_BUNDLE") != null,
+         .prompt_cache = h.store != null and !own_snaps, // (its rewind: a snap_* family's)
+         .warm_turns = h.store != null and !own_snaps and @hasDecl(F, "warm_quiet"),
+         .logprobs = loaded.backend.vtable.first_row != null,
+--- a/zig/src/server/anthropic.zig
++++ b/zig/src/server/anthropic.zig
+@@ -71,6 +71,7 @@
+             .ok => |v| v,
+             .err => |m| return sendError(conn, a, m, 400),
+         };
++        if (body.has("ablation")) return sendError(conn, a, "ablation requires /v1/chat/completions", 400);
+         const chat = translate(&cx, body, count) catch return sendError(conn, a, cx.message, cx.status());
+         if (count) {
+             const n = countTokens(srv, &cx, chat) catch return sendError(conn, a, cx.message, if (cx.kind == .capacity) 503 else 400);
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -22,6 +22,7 @@
+ 
+ /// What a route hands the reply: Python's chat() arguments.
+ pub const Input = struct {
++    runtime_directions: [44]u8 = @splat(0),
+     messages: Value = .{ .array = &.{} },
+     tools: []const Value = &.{},
+     prompt: ?Prompt = null,
+@@ -140,6 +141,7 @@
+     const drafts = srv.config.use_drafts and !(draft_field != null and draft_field.? == .bool and !draft_field.?.bool);
+     var request: api.Request = .{
+         .prompt = rendered.ids,
++        .runtime_directions = input.runtime_directions,
+         .lane_images = rendered.lane_images,
+         .max_tokens = @intCast(@min(limit, std.math.maxInt(u32))),
+         .sampling = sampling,
+@@ -219,7 +221,7 @@
+     const result: Failure!Reply = blk: {
+         if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
+         gen.loop(gone) catch |e| break :blk e;
+-        break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
++        break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts, input.runtime_directions);
+     };
+     if (result) |_| {} else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
+     return result;
+@@ -444,7 +446,7 @@
+         }
+     }
+ 
+-    fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool) Failure!Reply {
++    fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool, direction_packet: [44]u8) Failure!Reply {
+         const a = g.a;
+         const m = g.box;
+         if (!g.engine_done) g.drain();
+@@ -501,6 +503,10 @@
+         const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
+         const decode_tokens = g.collected.items.len -| 1;
+         const runtime = try json.newObject(a);
++        if (std.c.getenv("TF_RUNTIME_DIRECTIONS_BUNDLE") != null) {
++            try runtime.put(a, "directions_status", .{ .string = "experimental_unqualified" });
++            try runtime.put(a, "directions_packet_hex", .{ .string = try a.dupe(u8, &std.fmt.bytesToHex(direction_packet, .lower)) });
++        }
+         try runtime.put(a, "enable_thinking", .{ .bool = thinking });
+         try runtime.put(a, "reasoning_effort", if (!thinking) .{ .string = "none" } else if (effort) |e| .{ .string = e } else .null);
+         try runtime.put(a, "engine", .{ .string = g.srv.info.name });
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -138,6 +138,16 @@
+     const logprobs = if (is_chat) try fields.probabilityOptions(cx, body, exact_bytes) else try fields.legacyLogprobs(cx, body, exact_bytes);
+     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
+     var input: chat.Input = .{ .fields = undefined };
++    const runtime_api = @import("runtime_directions_api.zig");
++    if (body.get("ablation")) |v| {
++        if (!srv.info.runtime_directions_supported) return cx.refuse("this engine does not support runtime directions");
++        input.runtime_directions = try runtime_api.parse(cx, v);
++    }
++    if (std.c.getenv("TF_RUNTIME_DIRECTIONS_BUNDLE") != null) {
++        if (srv.config.compact_at != null) return cx.refuse("runtime directions v1 requires compaction disabled");
++        if (srv.cortheon != null) return cx.refuse("runtime directions v1 requires Cortheon disabled");
++        if (body.get("draft")) |v| if (v != .bool or v.bool) return cx.refuse("runtime directions v1 requires draft=false");
++    }
+     // a lane-vision engine takes image parts as the served lane renders them: their placeholders in the text, their
+     // bytes in input.lane_images (an engine with upstream's vision gets them as parts: normalizeWith)
+     var images: messages.Images = .{ .placeholder = if (srv.info.lane_vision) |v| v.placeholder else "" };
+@@ -156,6 +166,7 @@
+         .string => |t| input.cache_salt = if (t.len > 0) t else return cx.refuse("cache_salt must be a non-empty string"),
+         else => return cx.refuse("cache_salt must be a non-empty string"),
+     };
++    input.cache_salt = runtime_api.salt(cx.a, input.runtime_directions, input.cache_salt) catch return cx.refuse("invalid runtime weight identity");
+     // ``body.get("max_tokens") or body.get("max_completion_tokens")``: both are ints or None by now
+     const first = body.get("max_tokens");
+     const max = if (first != null and first.?.truthy()) first else body.get("max_completion_tokens");
+@@ -257,7 +268,7 @@
+         return;
+     };
+     p.input.id = id;
+-    const turn = cortheon.begin(srv, a, raw, id, is_chat, &p.input);
++    const turn = if (std.c.getenv("TF_RUNTIME_DIRECTIONS_BUNDLE") == null) cortheon.begin(srv, a, raw, id, is_chat, &p.input) else null;
+     var r: Run = .{ .srv = srv, .a = a, .out = out, .is_chat = is_chat, .plan = p, .id = id, .created = std.Io.Clock.real.now(srv.io).toSeconds(), .turn = turn };
+     if (p.stream) r.stream(gone, field) else r.whole(gone, field);
+ }
+--- a/zig/src/server/responses_translate.zig
++++ b/zig/src/server/responses_translate.zig
+@@ -267,6 +267,7 @@
+ 
+ /// A Responses request as the chat completion that runs it; ``history`` reads a stored conversation.
+ pub fn translate(cx: *Cx, body: Value, history: anytype) errors.Refused!Request {
++    if (body.has("ablation")) return cx.refuse("ablation requires /v1/chat/completions in this prototype");
+     const a = cx.a;
+     if (body != .object) return cx.refuse("the request body must be a JSON object");
+     _ = try fields.probabilityOptions(cx, body, false); // logprobs come on /v1/chat/completions only
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -59,6 +59,7 @@
+     _ = @import("compact_test.zig");
+     _ = @import("completion_prompt_test.zig");
+     _ = @import("cache_salt_test.zig");
++    _ = @import("runtime_directions_api.zig");
+     _ = @import("server_init_test.zig");
+     _ = @import("decisions.zig");
+     _ = @import("decisions_test.zig");
+--- /dev/null
++++ b/zig/src/server/runtime_directions_api.zig
+@@ -0,0 +1,103 @@
++//! Strict experimental request parser. The serving profile pins the one loaded set.
++const std = @import("std");
++const json = @import("json");
++const errors = @import("errors.zig");
++const Cx = errors.Cx;
++
++fn env(name: [:0]const u8) ?[]const u8 {
++    return std.mem.span(std.c.getenv(name) orelse return null);
++}
++
++pub fn parse(cx: *Cx, value: json.Value) errors.Refused![44]u8 {
++    if (value != .object) return cx.refuse("ablation must be an object");
++    if (!std.mem.eql(u8, env("TF_RUNTIME_DIRECTIONS_EXPERIMENTAL") orelse "", "1") or env("TF_RUNTIME_DIRECTIONS_BUNDLE") == null)
++        return cx.refuse("runtime directions are unavailable on this profile");
++    for (value.object.keys()) |key| {
++        var known = false;
++        for ([_][]const u8{ "projection_mode", "enabled", "strength", "direction_set", "layers" }) |name|
++            known = known or std.mem.eql(u8, key, name);
++        if (!known) return cx.refuse("unknown ablation field");
++    }
++    if (value.get("projection_mode")) |mode|
++        if (mode != .string or !std.mem.eql(u8, mode.string, "ablated")) return cx.refuse("only ablated projection_mode is supported");
++    const enabled = value.get("enabled") orelse json.Value{ .bool = false };
++    if (enabled != .bool) return cx.refuse("enabled must be boolean");
++    const strength = value.get("strength") orelse json.Value{ .float = 0 };
++    if (strength != .int and strength != .float) return cx.refuse("strength must be a number");
++    const alpha64 = strength.float64() orelse return cx.refuse("invalid strength");
++    if (!std.math.isFinite(alpha64) or alpha64 < 0 or alpha64 > 1 or (!enabled.bool and alpha64 != 0))
++        return cx.refuse("strength must be in [0,1], and zero when disabled");
++    const set = value.get("direction_set") orelse {
++        if (enabled.bool or value.has("layers")) return cx.refuse("direction_set is required");
++        return @splat(0);
++    };
++    if (set != .string or !std.mem.eql(u8, set.string, env("TF_RUNTIME_DIRECTIONS_SET") orelse ""))
++        return cx.refuse("unknown direction_set");
++    const allowed = std.fmt.parseInt(u64, env("TF_RUNTIME_DIRECTIONS_MASK") orelse "", 10) catch return cx.refuse("missing artifact layer mask");
++    var mask = allowed;
++    if (value.get("layers")) |layers| {
++        if (layers != .array or layers.array.len == 0 or layers.array.len > 40) return cx.refuse("expected 1-40 layers");
++        mask = 0;
++        for (layers.array) |layer| {
++            if (layer != .int) return cx.refuse("layers must be integers");
++            const n = layer.int64() orelse return cx.refuse("invalid layer");
++            if (n < 0 or n >= 40) return cx.refuse("layer outside 0-39");
++            const bit = @as(u64, 1) << @intCast(n);
++            if (mask & bit != 0 or allowed & bit == 0) return cx.refuse("duplicate or unavailable layer");
++            mask |= bit;
++        }
++    }
++    var result: [44]u8 = @splat(0);
++    const alpha: f32 = @floatCast(alpha64);
++    std.mem.writeInt(u32, result[0..4], @bitCast(alpha), .little);
++    std.mem.writeInt(u64, result[4..12], mask, .little);
++    const hash = env("TF_RUNTIME_DIRECTIONS_SHA256") orelse return cx.refuse("missing artifact SHA256");
++    if (hash.len != 64) return cx.refuse("invalid artifact SHA256");
++    _ = std.fmt.hexToBytes(result[12..44], hash) catch return cx.refuse("invalid artifact SHA256");
++    return result;
++}
++
++pub fn salt(a: std.mem.Allocator, packet: [44]u8, user: ?[]const u8) !?[]const u8 {
++    if (env("TF_RUNTIME_DIRECTIONS_BUNDLE") == null) return user;
++    const weights = env("TF_RUNTIME_DIRECTIONS_WEIGHTS_SHA256") orelse return error.MissingWeightIdentity;
++    if (weights.len != 64) return error.MissingWeightIdentity;
++    // Length-prefixed user salt prevents concatenation collisions; packet includes bundle, alpha and mask.
++    const user_salt: []const u8 = user orelse "";
++    return try std.fmt.allocPrint(a, "runtime-directions:wo_b-pre-gather-v1:e100ee8b:{s}:{s}:{d}:{s}", .{ weights, std.fmt.bytesToHex(packet, .lower), user_salt.len, user_salt });
++}
++
++extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
++extern "c" fn unsetenv([*:0]const u8) c_int;
++
++test "runtime directions strict schema, canonical packet, cache isolation" {
++    const vars = .{
++        .{ "TF_RUNTIME_DIRECTIONS_BUNDLE", "/fixture-only" },
++        .{ "TF_RUNTIME_DIRECTIONS_EXPERIMENTAL", "1" },
++        .{ "TF_RUNTIME_DIRECTIONS_SET", "fixture" },
++        .{ "TF_RUNTIME_DIRECTIONS_MASK", "12" },
++        .{ "TF_RUNTIME_DIRECTIONS_SHA256", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
++        .{ "TF_RUNTIME_DIRECTIONS_WEIGHTS_SHA256", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
++    };
++    inline for (vars) |pair| try std.testing.expectEqual(@as(c_int, 0), setenv(pair[0], pair[1], 1));
++    defer inline for (vars) |pair| {
++        _ = unsetenv(pair[0]);
++    };
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    var cx: Cx = .{ .a = arena.allocator() };
++    const valid = (try json.parse(cx.a, "{\"direction_set\":\"fixture\",\"enabled\":true,\"strength\":0.5,\"layers\":[3,2]}")).ok;
++    const packet = try parse(&cx, valid);
++    try std.testing.expectEqual(@as(f32, 0.5), @as(f32, @bitCast(std.mem.readInt(u32, packet[0..4], .little))));
++    try std.testing.expectEqual(@as(u64, 12), std.mem.readInt(u64, packet[4..12], .little));
++    const first = (try salt(cx.a, packet, "user")).?;
++    try std.testing.expectEqualStrings(first, (try salt(cx.a, packet, "user")).?);
++    try std.testing.expect(!std.mem.eql(u8, first, (try salt(cx.a, @splat(0), "user")).?));
++    try std.testing.expect(!std.mem.eql(u8, first, (try salt(cx.a, packet, "other")).?));
++    for ([_][]const u8{
++        "null",                            "[]",                                               "{\"extra\":1}",                                   "{\"enabled\":1}",                                   "{\"strength\":true}",
++        "{\"strength\":-1}",               "{\"strength\":2}",                                 "{\"strength\":0.5}",                              "{\"enabled\":true}",                                "{\"projection_mode\":\"original_projections\"}",
++        "{\"direction_set\":\"missing\"}", "{\"direction_set\":\"fixture\",\"layers\":[2,2]}", "{\"direction_set\":\"fixture\",\"layers\":[40]}", "{\"direction_set\":\"fixture\",\"layers\":[true]}", "{\"direction_set\":\"fixture\",\"layers\":[]}",
++    }) |text| try std.testing.expectError(error.Refused, parse(&cx, (try json.parse(cx.a, text)).ok));
++    _ = unsetenv("TF_RUNTIME_DIRECTIONS_EXPERIMENTAL");
++    try std.testing.expectError(error.Refused, parse(&cx, valid));
++}
+--- a/zig/src/server/warm.zig
++++ b/zig/src/server/warm.zig
+@@ -27,6 +27,7 @@
+ 
+ /// Prefill the conversation, `message` (the reply as sent) and the next turn's opening, on `warm_turns` engines.
+ pub fn reply(srv: *Server, input: chat.Input, message: Value, thinking: bool, effort: ?[]const u8, prompt_len: usize) void {
++    if (std.c.getenv("TF_RUNTIME_DIRECTIONS_BUNDLE") != null) return;
+     if (!srv.info.warm_turns or input.prompt != null or input.messages != .array) return;
+     start(srv, input, message, thinking, effort, prompt_len) catch |e| log.line("next turn: no background prefill ({s})", .{@errorName(e)});
+ }

@@ -1,0 +1,4 @@
+/TensorFold/
+/build/
+/acceptance*.json
+__pycache__/
