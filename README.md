@@ -94,6 +94,22 @@ Omit `ablation` for baseline. The ON example adds the following top-level field 
 
 The qualifier checks the echoed descriptor, deterministic OFF return, streaming, rejection of malformed settings and warm-prefix reuse. It writes full responses to a local file. Identical generated text on a simple prompt can accompany a real logit change. For the reference logit comparison and its limitations, see [the results](RESULTS.md).
 
+## Use the switch in Pi
+
+Install the [Pi extension](https://github.com/anvarazizov/pi-runtime-ablation) once:
+
+```sh
+pi install git:github.com/anvarazizov/pi-runtime-ablation@v0.1.0
+```
+
+Start Pi with the model ID from your Pi provider entry. For the C32 release:
+
+```sh
+ABLATION_MODEL=deepseek-v4.1-flash-1017-directions-c32 pi
+```
+
+Select that model through a provider configured for chat completions. For C1 use `deepseek-v4.1-flash-1017-runtime-directions-tp2`, or use the alias your gateway exposes. In the session, use `/ablation half`, `/ablation full` or `/ablation off`. The footer shows the current setting. Leave `ABLATION_SCALE=1` for the kernels in this recipe.
+
 ## Credits
 
 TensorFold by Ash Hart and contributors, DeepSeek GB10 port and EXL3 packaging by Bertholomus and contributors, DeepSeek model by DeepSeek-AI, and projected directions by pqhaz. This recipe adds the request controls, TP2 activation hook, cache isolation and verification. TensorFold notices and license texts accompany the patch. Model weights, kernel kits and the author's direction archive are obtained from their respective projects.
