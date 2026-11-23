@@ -1,0 +1,17 @@
+{
+  "model": "deepseek-v4.1-flash-1017-directions-c32",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 17 + 25? Reply with just the number."
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 128,
+  "reasoning_effort": "none",
+  "ablation": {
+    "enabled": true,
+    "strength": 0.5,
+    "direction_set": "pqhaz-1017-projected-experimental"
+  }
+}

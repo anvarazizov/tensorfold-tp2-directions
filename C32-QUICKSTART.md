@@ -25,6 +25,8 @@ python3 portable.py plan --config ../target-tp2.json --inspection ../inspect-c32
 
 Run the numerical kernel and two-rank RDMA checks in section 2 of the archive README. Copy each generated create script to its corresponding rank and execute it there. Start the resulting containers through the local supervisor, rank 0 followed by rank 1. Wait for model readiness. Keep the candidate endpoint isolated from other traffic.
 
+Sample chat requests for this model are in [examples/c32](examples/c32).
+
 ## Run the verified 32 × 32K workload
 
 The default profile has 32 streams, 32,768 context positions per stream and a shared pool of 1,048,576 positions. Open a tunnel in a separate terminal:
